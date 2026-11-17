@@ -1,0 +1,15 @@
+{
+    "$schema": "https://moddbcdn.vintagestory.at/schema/modinfo.latest.json",
+    "type": "Code",
+    "modid": "dynamiccamera",
+    "name": "Dynamic Camera",
+    "authors": [ "SecretLovers" ],
+    "description": "Strafing and turning tilt the camera.",
+    "version": "1.0.0",
+    "side": "Client",
+    "requiredOnClient": false,
+    "requiredOnServer": false,
+    "dependencies": {
+        "game": "1.22.0"
+    }
+}
