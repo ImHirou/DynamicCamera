@@ -11,6 +11,7 @@ namespace DynamicCamera.Effects;
 /// <summary>
 /// Trauma-based screen shakes. Each shake fades out quadratically over its length and,
 /// if it has a position, also with the distance to the camera.
+/// The game's own camera shake is mirrored by a separate, positionless channel (<see cref="ExternalStrength"/>).
 /// </summary>
 internal sealed class ScreenShakes
 {
@@ -61,6 +62,36 @@ internal sealed class ScreenShakes
     public double OffsetYaw { get; private set; }
     public double OffsetRoll { get; private set; }
 
+    /// <summary>
+    /// Strength of the game's own camera shake (<c>ClientMain.AddCameraShake</c> and friends).
+    /// Decays by 1 per second, like the vanilla value it replaces.
+    /// </summary>
+    public double ExternalStrength { get; private set; }
+
+    public void AddExternal(double strength)
+    {
+        if (double.IsFinite(strength))
+        {
+            ExternalStrength = Math.Max(0.0, ExternalStrength + strength);
+        }
+    }
+
+    public void SetExternal(double strength)
+    {
+        if (double.IsFinite(strength))
+        {
+            ExternalStrength = Math.Max(0.0, strength);
+        }
+    }
+
+    public void ReduceExternal(double amount)
+    {
+        if (double.IsFinite(amount))
+        {
+            ExternalStrength = Math.Max(0.0, ExternalStrength - amount);
+        }
+    }
+
     public Slot Get(long handle) => IsHandleValid(handle) ? instances[ExtractIndex(handle)]! : dummyInstance;
 
     public Slot CreateDirect() => Get(Create());
@@ -108,15 +139,20 @@ internal sealed class ScreenShakes
         }
 
         instanceMask = 0UL;
+        ExternalStrength = 0.0;
         OffsetPitch = OffsetYaw = OffsetRoll = 0.0;
     }
 
-    /// <summary> Recomputes the combined shake rotation for a camera at the given position. </summary>
-    public void Update(double x, double y, double z, GeneralSettings cfg)
+    /// <summary>
+    /// Recomputes the combined shake rotation for a camera at the given position.
+    /// <paramref name="scale"/> multiplies the maximum intensity (the game's accessibility setting).
+    /// </summary>
+    public void Update(double x, double y, double z, GeneralSettings cfg, double scale, double deltaTime)
     {
+        ExternalStrength = Math.Max(0.0, ExternalStrength - deltaTime);
         GetNoiseAtPosition(x, y, z, cfg, out double noiseX, out double noiseY, out double noiseZ);
 
-        double maxIntensity = cfg.ScreenShakesMaxIntensity;
+        double maxIntensity = cfg.ScreenShakesMaxIntensity * scale;
         OffsetPitch = noiseX * maxIntensity;
         OffsetYaw = noiseY * maxIntensity;
         OffsetRoll = noiseZ * maxIntensity;
@@ -170,6 +206,16 @@ internal sealed class ScreenShakes
             noiseY += SimplexNoise.Noise(sampleStep, -420.0) * intensity;
             noiseZ += SimplexNoise.Noise(sampleStep, -1337.0) * intensity;
             total += intensity;
+        }
+
+        double external = MathUtils.Clamp01(ExternalStrength * cfg.VanillaShakeTraumaScale);
+
+        if (external > 0.0)
+        {
+            noiseX += SimplexNoise.Noise(sampleBase, 777.0) * external;
+            noiseY += SimplexNoise.Noise(sampleBase, 2048.0) * external;
+            noiseZ += SimplexNoise.Noise(sampleBase, 4096.0) * external;
+            total += external;
         }
 
         // Don't go overboard.

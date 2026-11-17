@@ -14,13 +14,17 @@ namespace DynamicCamera.Gui;
 internal sealed class SettingsEditor
 {
     private const string L = DynamicCameraModSystem.Domain + ":";
+    private const uint MaxSoundPatternLength = 256;
 
     private static readonly Vector4 UnsavedColor = new(1f, 0.78f, 0.35f, 1f);
+    private static readonly Vector4 ErrorColor = new(1f, 0.45f, 0.4f, 1f);
     private static readonly MovementContext[] Contexts = Enum.GetValues<MovementContext>();
     private static readonly string[] ContextNames = Array.ConvertAll(Contexts, context => context.ToString().ToLowerInvariant());
+    private static readonly SoundShake BlankSoundShake = new();
 
     private readonly DynamicCameraModSystem mod;
     private readonly DynamicCameraConfig defaults = new();
+    private string? errorText;
 
     public SettingsEditor(DynamicCameraModSystem mod)
     {
@@ -34,6 +38,7 @@ internal sealed class SettingsEditor
         if (mod.SaveConfig())
         {
             HasUnsavedChanges = false;
+            errorText = null;
         }
     }
 
@@ -45,17 +50,25 @@ internal sealed class SettingsEditor
         }
     }
 
-    /// <summary> Discards unsaved changes by reading the config file again. </summary>
+    /// <summary> Discards unsaved changes by reading the config file again. A broken file leaves the settings as they are. </summary>
     public void Revert()
     {
-        mod.ReloadConfig();
-        HasUnsavedChanges = false;
+        if (mod.ReloadConfig())
+        {
+            HasUnsavedChanges = false;
+            errorText = null;
+        }
+        else
+        {
+            errorText = Lang.Get(L + "gui-reload-failed", DynamicCameraConfig.FileName, DynamicCameraModSystem.BrokenConfigFileName);
+        }
     }
 
     public void ResetToDefaults()
     {
         mod.ResetConfigToDefaults();
         HasUnsavedChanges = true;
+        errorText = null;
     }
 
     public void Draw(bool showFileButtons)
@@ -63,6 +76,8 @@ internal sealed class SettingsEditor
         var cfg = mod.Config;
         var general = cfg.General;
         var generalDefaults = defaults.General;
+        // The unit is appended to an ImGui printf format, so a stray '%' must not reach it.
+        string secondsFormat = "%.2f " + Lang.Get(L + "gui-unit-seconds").Replace("%", "%%");
 
         ImGui.PushID("dynamiccamera-settings");
         ImGui.PushItemWidth(ImGui.GetContentRegionAvail().X * 0.45f);
@@ -77,11 +92,17 @@ internal sealed class SettingsEditor
             ColoredText(Lang.Get(L + "gui-unsaved"), UnsavedColor);
         }
 
+        if (errorText != null)
+        {
+            WrappedColoredText(errorText, ErrorColor);
+        }
+
         WrappedDisabledText(Lang.Get(L + "gui-hint"));
 
         Checkbox("enabled", ref general.Enabled, generalDefaults.Enabled);
         Checkbox("enableinthirdperson", ref general.EnableInThirdPerson, generalDefaults.EnableInThirdPerson);
         Checkbox("aimfollowscamera", ref general.AimFollowsCamera, generalDefaults.AimFollowsCamera);
+        Slider("effectsintensity", ref general.EffectsIntensity, generalDefaults.EffectsIntensity, 0f, 2f, "%.2f");
         Slider("contexttransitionsmoothing", ref general.ContextTransitionSmoothing, generalDefaults.ContextTransitionSmoothing, 0f, 0.95f, "%.2f");
 
         if (ImGui.CollapsingHeader(Lang.Get(L + "gui-section-turning") + "##turning"))
@@ -93,9 +114,6 @@ internal sealed class SettingsEditor
 
         if (ImGui.CollapsingHeader(Lang.Get(L + "gui-section-sway") + "##sway"))
         {
-            // The unit is appended to an ImGui printf format, so a stray '%' must not reach it.
-            string secondsFormat = "%.2f " + Lang.Get(L + "gui-unit-seconds").Replace("%", "%%");
-
             Slider("cameraswayintensity", ref general.CameraSwayIntensity, generalDefaults.CameraSwayIntensity, 0f, 5f, "%.2f");
             Slider("cameraswayfrequency", ref general.CameraSwayFrequency, generalDefaults.CameraSwayFrequency, 0f, 2f, "%.3f");
             Slider("cameraswayfadeindelay", ref general.CameraSwayFadeInDelay, generalDefaults.CameraSwayFadeInDelay, 0f, 30f, secondsFormat);
@@ -107,15 +125,40 @@ internal sealed class SettingsEditor
         {
             Slider("screenshakesmaxintensity", ref general.ScreenShakesMaxIntensity, generalDefaults.ScreenShakesMaxIntensity, 0f, 10f, "%.2f");
             Slider("screenshakesmaxfrequency", ref general.ScreenShakesMaxFrequency, generalDefaults.ScreenShakesMaxFrequency, 0f, 20f, "%.2f");
-            Slider("explosiontrauma", ref general.ExplosionTrauma, generalDefaults.ExplosionTrauma, 0f, 1f, "%.3f");
+            Checkbox("respectgameshakesetting", ref general.RespectGameShakeSetting, generalDefaults.RespectGameShakeSetting);
+            Slider("lightningtrauma", ref general.LightningTrauma, generalDefaults.LightningTrauma, 0f, 1f, "%.3f");
             Slider("thundertrauma", ref general.ThunderTrauma, generalDefaults.ThunderTrauma, 0f, 1f, "%.3f");
             Slider("handswingtrauma", ref general.HandSwingTrauma, generalDefaults.HandSwingTrauma, 0f, 1f, "%.3f");
             DrawShakePreviewButtons(general);
+
+            ImGui.Spacing();
+            ImGui.TextUnformatted(Lang.Get(L + "gui-vanillashakes"));
+            Checkbox("convertvanillashakes", ref general.ConvertVanillaShakes, generalDefaults.ConvertVanillaShakes);
+            ImGui.BeginDisabled(!general.ConvertVanillaShakes);
+            Checkbox("suppressvanillashakejitter", ref general.SuppressVanillaShakeJitter, generalDefaults.SuppressVanillaShakeJitter);
+            Slider("vanillashaketraumascale", ref general.VanillaShakeTraumaScale, generalDefaults.VanillaShakeTraumaScale, 0f, 3f, "%.2f");
+            ImGui.EndDisabled();
+        }
+
+        if (ImGui.CollapsingHeader(Lang.Get(L + "gui-section-sounds") + "##sounds"))
+        {
+            DrawSoundShakes(cfg, secondsFormat);
+        }
+
+        if (ImGui.CollapsingHeader(Lang.Get(L + "gui-section-impacts") + "##impacts"))
+        {
+            Slider("landingpitchintensity", ref general.LandingPitchIntensity, generalDefaults.LandingPitchIntensity, 0f, 15f, "%.1f");
+            Slider("landingtrauma", ref general.LandingTrauma, generalDefaults.LandingTrauma, 0f, 1f, "%.3f");
+            Slider("landingthreshold", ref general.LandingThreshold, generalDefaults.LandingThreshold, 0.1f, 2f, "%.2f");
+            Slider("hurtkickintensity", ref general.HurtKickIntensity, generalDefaults.HurtKickIntensity, 0f, 15f, "%.1f");
+            DrawImpactPreviewButtons();
         }
 
         if (ImGui.CollapsingHeader(Lang.Get(L + "gui-section-contexts") + "##contexts", ImGuiTreeNodeFlags.DefaultOpen))
         {
             WrappedDisabledText(Lang.Get(L + "gui-contexts-hint"));
+            Slider("maxvelocitypitch", ref general.MaxVelocityPitch, generalDefaults.MaxVelocityPitch, 0f, 90f, "%.0f");
+            Slider("maxvelocityroll", ref general.MaxVelocityRoll, generalDefaults.MaxVelocityRoll, 0f, 90f, "%.0f");
 
             if (ImGui.BeginTabBar("contexts"))
             {
@@ -177,9 +220,9 @@ internal sealed class SettingsEditor
         ImGui.SameLine();
 
         // Same parameters as the real sources, at point-blank range.
-        if (ImGui.SmallButton(Lang.Get(L + "gui-preview-explosion") + "##preview-explosion"))
+        if (ImGui.SmallButton(Lang.Get(L + "gui-preview-lightning") + "##preview-lightning"))
         {
-            mod.PreviewShake(general.ExplosionTrauma, 1f, 2f);
+            mod.PreviewShake(general.LightningTrauma, 1f, 3f);
         }
 
         ImGui.SameLine();
@@ -195,6 +238,109 @@ internal sealed class SettingsEditor
         {
             mod.OnHandSwing();
         }
+    }
+
+    private void DrawImpactPreviewButtons()
+    {
+        ImGui.TextUnformatted(Lang.Get(L + "gui-preview"));
+        ImGui.SameLine();
+
+        if (ImGui.SmallButton(Lang.Get(L + "gui-preview-landing") + "##preview-landing"))
+        {
+            mod.PreviewLanding();
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.SmallButton(Lang.Get(L + "gui-preview-hurt") + "##preview-hurt"))
+        {
+            mod.PreviewHurt();
+        }
+    }
+
+    private void DrawSoundShakes(DynamicCameraConfig cfg, string secondsFormat)
+    {
+        WrappedDisabledText(Lang.Get(L + "gui-sounds-hint"));
+
+        var shakes = cfg.SoundShakes;
+        int removeAt = -1;
+
+        for (int i = 0; i < shakes.Count; i++)
+        {
+            var shake = shakes[i];
+            var shakeDefaults = FindDefaultSoundShake(shake.Sound);
+
+            ImGui.PushID(i);
+            ImGui.Separator();
+
+            string sound = shake.Sound;
+
+            if (ImGui.InputText(Lang.Get(L + "setting-sound") + "##sound", ref sound, MaxSoundPatternLength))
+            {
+                shake.Sound = sound;
+                HasUnsavedChanges = true;
+            }
+
+            ItemTooltip(Lang.Get(L + "setting-sound-desc"));
+
+            Slider("soundtrauma", ref shake.Trauma, shakeDefaults.Trauma, 0f, 1f, "%.3f");
+            Checkbox("soundradiusfromexplosionrange", ref shake.RadiusFromExplosionRange, shakeDefaults.RadiusFromExplosionRange);
+            ImGui.BeginDisabled(shake.RadiusFromExplosionRange);
+            Slider("soundradius", ref shake.Radius, shakeDefaults.Radius, 1f, 192f, "%.0f");
+            ImGui.EndDisabled();
+            Slider("soundlength", ref shake.LengthInSeconds, shakeDefaults.LengthInSeconds, 0f, 10f, secondsFormat);
+            Slider("soundfrequency", ref shake.Frequency, shakeDefaults.Frequency, 0f, 5f, "%.2f");
+
+            if (ImGui.SmallButton(Lang.Get(L + "gui-sound-preview") + "##preview"))
+            {
+                mod.PreviewShake(shake.Trauma, shake.Frequency, shake.LengthInSeconds);
+            }
+
+            ImGui.SameLine();
+
+            if (ImGui.SmallButton(Lang.Get(L + "gui-sound-remove") + "##remove"))
+            {
+                removeAt = i;
+            }
+
+            ImGui.PopID();
+        }
+
+        if (removeAt >= 0)
+        {
+            shakes.RemoveAt(removeAt);
+            HasUnsavedChanges = true;
+        }
+
+        ImGui.Separator();
+
+        if (ImGui.Button(Lang.Get(L + "gui-sound-add") + "##sound-add"))
+        {
+            shakes.Add(new SoundShake());
+            HasUnsavedChanges = true;
+        }
+
+        ImGui.SameLine();
+
+        if (ImGui.Button(Lang.Get(L + "gui-sound-reset") + "##sound-reset"))
+        {
+            cfg.SoundShakes = DynamicCameraConfig.CreateDefaultSoundShakes();
+            HasUnsavedChanges = true;
+        }
+    }
+
+    /// <summary> The default entry with the same sound, so that right-click resets to its values. </summary>
+    private SoundShake FindDefaultSoundShake(string sound)
+    {
+        foreach (var shake in defaults.SoundShakes)
+        {
+            if (string.Equals(shake.Sound, sound, StringComparison.OrdinalIgnoreCase))
+            {
+                return shake;
+            }
+        }
+
+        return BlankSoundShake;
     }
 
     private void DrawContext(ContextSettings settings, ContextSettings contextDefaults)
@@ -284,6 +430,13 @@ internal sealed class SettingsEditor
         ImGui.PushStyleColor(ImGuiCol.Text, color);
         ImGui.TextUnformatted(text);
         ImGui.PopStyleColor();
+    }
+
+    private static void WrappedColoredText(string text, Vector4 color)
+    {
+        ImGui.PushTextWrapPos(0f);
+        ColoredText(text, color);
+        ImGui.PopTextWrapPos();
     }
 
     private static void DisabledText(string text)

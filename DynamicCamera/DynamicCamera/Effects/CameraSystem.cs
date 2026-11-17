@@ -16,6 +16,11 @@ internal sealed class CameraSystem
     // even though Vintage Story's velocities and smoothed mouse angles converge to rest asymptotically.
     private const double ActionVelocityThreshold = 0.002;
     private const double ActionRotationThreshold = 0.001;
+    // Moving faster than this (about 0.2 blocks per second) always counts as an action, even at a constant velocity.
+    private const double ActionSpeedThreshold = 0.01;
+
+    /// <summary> Damage at which the hurt kick reaches its full strength. </summary>
+    public const double HurtKickFullDamage = 6.0;
 
     private readonly Func<DynamicCameraConfig> configProvider;
 
@@ -40,6 +45,9 @@ internal sealed class CameraSystem
     /// <summary> Seconds of unpaused rendering since the system was created. </summary>
     public double Time { get; private set; }
 
+    /// <summary> False while the effects are off, because of the settings or the current perspective. </summary>
+    public bool IsActive { get; private set; }
+
     public double OffsetPitch { get; private set; }
     public double OffsetYaw { get; private set; }
     public double OffsetRoll { get; private set; }
@@ -52,6 +60,7 @@ internal sealed class CameraSystem
     /// <summary> Forgets all frame-to-frame state. Use after the camera was taken over or effects were off. </summary>
     public void ResetState()
     {
+        IsActive = false;
         hasPreviousFrame = false;
         prevPerspective = null;
         msInit = false;
@@ -61,6 +70,9 @@ internal sealed class CameraSystem
         prevStrafingRollOffset = 0.0;
         cameraSwayFactor = 0.0;
         cameraSwayFactorTarget = 0.0;
+        wasAirborne = false;
+        landingStartTime = double.NegativeInfinity;
+        hurtStartTime = double.NegativeInfinity;
         OffsetPitch = OffsetYaw = OffsetRoll = 0.0;
         lastActionTime = Time;
     }
@@ -70,32 +82,35 @@ internal sealed class CameraSystem
         Time += deltaTime;
         Shakes.Time = Time;
         cfg = configProvider();
+        var general = cfg.General;
 
         UpdateContext(context, deltaTime);
 
         // Always sample the shakes, so that finished ones are freed even while the effects are disabled.
-        Shakes.Update(context.PositionX, context.PositionY, context.PositionZ, cfg.General);
+        Shakes.Update(context.PositionX, context.PositionY, context.PositionZ, general, context.ShakeScale, deltaTime);
 
-        if (!cfg.General.Enabled || (!cfg.General.EnableInThirdPerson && context.Perspective != CameraPerspective.FirstPerson))
+        if (!general.Enabled || (!general.EnableInThirdPerson && context.Perspective != CameraPerspective.FirstPerson))
         {
             ResetState();
             return;
         }
 
-        if (hasPreviousFrame
-            && (Math.Abs(context.VelocityX - prevVelocityX) > ActionVelocityThreshold
-                || Math.Abs(context.VelocityY - prevVelocityY) > ActionVelocityThreshold
-                || Math.Abs(context.VelocityZ - prevVelocityZ) > ActionVelocityThreshold
-                || Math.Abs(MathUtils.WrapDegrees(context.Pitch - prevPitch)) > ActionRotationThreshold
-                || Math.Abs(MathUtils.WrapDegrees(context.Yaw - prevYaw)) > ActionRotationThreshold))
+        IsActive = true;
+
+        if (IsPlayerAction(context))
         {
             NotifyOfPlayerAction();
         }
 
+        UpdateLanding(context);
+
+        // The camera smoothing only delays the view, so the effects intensity does not apply to it.
+        double smoothPitch = 0.0, smoothYaw = 0.0;
+        CameraSmoothingOffset(context, deltaTime, ref smoothPitch, ref smoothYaw);
+
         double pitch = 0.0, yaw = 0.0, roll = 0.0;
 
         // Pitch & yaw
-        CameraSmoothingOffset(context, deltaTime, ref pitch, ref yaw);
         NoiseOffset(deltaTime, ref pitch, ref yaw);
         // Pitch
         pitch += VerticalVelocityPitchOffset(context, deltaTime);
@@ -103,10 +118,13 @@ internal sealed class CameraSystem
         // Roll
         roll += TurningRollOffset(context, deltaTime);
         roll += StrafingRollOffset(context, deltaTime);
+        // Landings and hits
+        ImpulseOffsets(ref pitch, ref roll);
 
-        OffsetPitch = pitch + Shakes.OffsetPitch;
-        OffsetYaw = yaw + Shakes.OffsetYaw;
-        OffsetRoll = roll + Shakes.OffsetRoll;
+        double intensity = Math.Max(0.0, general.EffectsIntensity);
+        OffsetPitch = smoothPitch + (pitch + Shakes.OffsetPitch) * intensity;
+        OffsetYaw = smoothYaw + (yaw + Shakes.OffsetYaw) * intensity;
+        OffsetRoll = (roll + Shakes.OffsetRoll) * intensity;
 
         prevVelocityX = context.VelocityX;
         prevVelocityY = context.VelocityY;
@@ -117,6 +135,22 @@ internal sealed class CameraSystem
         hasPreviousFrame = true;
     }
 
+    private bool IsPlayerAction(CameraContext context)
+    {
+        if (context.HasMovementInput
+            || context.VelocityX * context.VelocityX + context.VelocityZ * context.VelocityZ > ActionSpeedThreshold * ActionSpeedThreshold)
+        {
+            return true;
+        }
+
+        return hasPreviousFrame
+            && (Math.Abs(context.VelocityX - prevVelocityX) > ActionVelocityThreshold
+                || Math.Abs(context.VelocityY - prevVelocityY) > ActionVelocityThreshold
+                || Math.Abs(context.VelocityZ - prevVelocityZ) > ActionVelocityThreshold
+                || Math.Abs(MathUtils.WrapDegrees(context.Pitch - prevPitch)) > ActionRotationThreshold
+                || Math.Abs(MathUtils.WrapDegrees(context.Yaw - prevYaw)) > ActionRotationThreshold);
+    }
+
     private void UpdateContext(CameraContext context, double deltaTime)
     {
         ContextSettings target;
@@ -124,6 +158,8 @@ internal sealed class CameraSystem
         else if (context.IsRidingMount) target = cfg.Mounts;
         else if (context.IsSwimming) target = cfg.Swimming;
         else if (context.IsGliding) target = cfg.Gliding;
+        else if (context.IsFlying) target = cfg.Flying;
+        else if (context.IsClimbing) target = cfg.Climbing;
         else if (context.IsSprinting) target = cfg.Sprinting;
         else target = cfg.Walking;
 
@@ -155,6 +191,8 @@ internal sealed class CameraSystem
             targetOffset = 0.0;
         }
 
+        targetOffset = MathUtils.SoftLimit(targetOffset, cfg.General.MaxVelocityPitch);
+
         double currentOffset = MathUtils.Damp(prevVerticalVelocityPitchOffset, targetOffset, smoothing, deltaTime);
         prevVerticalVelocityPitchOffset = currentOffset;
         return currentOffset;
@@ -169,7 +207,7 @@ internal sealed class CameraSystem
         double smoothing = BaseForwardPitchSmoothing * ctxCfg.HorizontalVelocitySmoothingFactor;
 
         context.GetForwardRelativeVelocity(out _, out double forward);
-        double targetOffset = forward * multiplier;
+        double targetOffset = MathUtils.SoftLimit(forward * multiplier, cfg.General.MaxVelocityPitch);
         double currentOffset = MathUtils.Damp(prevForwardVelocityPitchOffset, targetOffset, smoothing, deltaTime);
 
         prevForwardVelocityPitchOffset = currentOffset;
@@ -211,7 +249,7 @@ internal sealed class CameraSystem
         double smoothing = BaseStrafingRollSmoothing * ctxCfg.HorizontalVelocitySmoothingFactor;
 
         context.GetForwardRelativeVelocity(out double left, out _);
-        double target = -left * multiplier;
+        double target = MathUtils.SoftLimit(-left * multiplier, cfg.General.MaxVelocityRoll);
         double offset = MathUtils.Damp(prevStrafingRollOffset, target, smoothing, deltaTime);
 
         prevStrafingRollOffset = offset;
@@ -295,4 +333,106 @@ internal sealed class CameraSystem
         yaw += MathUtils.WrapDegrees(smYaw - yawNow);
         pitch += MathUtils.WrapDegrees(smPitch - pitchNow);
     }
+
+    #region Impacts
+
+    private const double LandingPitchLength = 0.35;
+    private const float LandingShakeLength = 0.4f;
+    private const float LandingShakeFrequency = 0.8f;
+    private const double HurtKickLength = 0.3;
+
+    private bool wasAirborne;
+    private double airborneMinVelocityY;
+    private double landingStartTime = double.NegativeInfinity;
+    private double landingPitch;
+    private double hurtStartTime = double.NegativeInfinity;
+    private double hurtPitch;
+    private double hurtRoll;
+
+    /// <summary> Dips the camera like after a fall. <paramref name="strength"/> is 0..1. </summary>
+    public void TriggerLanding(double strength)
+    {
+        if (!IsActive || !(strength > 0.0))
+        {
+            return;
+        }
+
+        var general = cfg.General;
+        landingStartTime = Time;
+        landingPitch = general.LandingPitchIntensity * strength;
+
+        if (general.LandingTrauma > 0f)
+        {
+            var shake = Shakes.CreateDirect();
+            shake.Trauma = (float)(general.LandingTrauma * strength);
+            shake.Frequency = LandingShakeFrequency;
+            shake.LengthInSeconds = LandingShakeLength;
+        }
+
+        NotifyOfPlayerAction();
+    }
+
+    /// <summary>
+    /// Kicks the camera away from a hit. <paramref name="right"/> and <paramref name="forward"/> are the knockback direction
+    /// projected on the view's right and forward axes (-1..1).
+    /// </summary>
+    public void OnPlayerHurt(double damage, double right, double forward)
+    {
+        if (!IsActive)
+        {
+            return;
+        }
+
+        double strength = MathUtils.Clamp01(damage / HurtKickFullDamage) * cfg.General.HurtKickIntensity;
+
+        if (strength == 0.0 || !double.IsFinite(strength))
+        {
+            return;
+        }
+
+        // Positive roll tilts clockwise and positive pitch looks down:
+        // a hit from the left tilts the head to the right, a hit from the front throws it back.
+        hurtStartTime = Time;
+        hurtRoll = strength * right;
+        hurtPitch = strength * 0.5 * forward;
+        NotifyOfPlayerAction();
+    }
+
+    private void UpdateLanding(CameraContext context)
+    {
+        if (context.IsSwimming || context.IsGliding || context.IsFlying || context.IsClimbing || context.IsRiding)
+        {
+            wasAirborne = false;
+            return;
+        }
+
+        if (!context.IsOnGround)
+        {
+            airborneMinVelocityY = wasAirborne ? Math.Min(airborneMinVelocityY, context.VelocityY) : context.VelocityY;
+            wasAirborne = true;
+            return;
+        }
+
+        if (!wasAirborne)
+        {
+            return;
+        }
+
+        wasAirborne = false;
+
+        // Full strength at twice the threshold speed.
+        double threshold = Math.Max(cfg.General.LandingThreshold, 0.01);
+        TriggerLanding(MathUtils.Clamp01((-airborneMinVelocityY - threshold) / threshold));
+    }
+
+    private void ImpulseOffsets(ref double pitch, ref double roll)
+    {
+        pitch += landingPitch * MathUtils.ImpulseEnvelope(Time - landingStartTime, LandingPitchLength);
+
+        double hurt = MathUtils.ImpulseEnvelope(Time - hurtStartTime, HurtKickLength);
+        pitch += hurtPitch * hurt;
+        roll += hurtRoll * hurt;
+    }
+
+    #endregion
 }

@@ -91,6 +91,47 @@ internal static class MathUtils
         outY = sin * x + cos * y;
     }
 
+    /// <summary>
+    /// Keeps values up to half of <paramref name="max"/> unchanged and smoothly compresses larger ones, so that the result never exceeds
+    /// <paramref name="max"/> in magnitude. A non-positive <paramref name="max"/> disables the limit.
+    /// </summary>
+    public static double SoftLimit(double value, double max)
+    {
+        if (!(max > 0.0))
+        {
+            return value;
+        }
+
+        double knee = max * 0.5;
+        double magnitude = Math.Abs(value);
+
+        if (magnitude <= knee)
+        {
+            return value;
+        }
+
+        double range = max - knee;
+        return Math.Sign(value) * (knee + range * Math.Tanh((magnitude - knee) / range));
+    }
+
+    // Maximum of sin(pi * u) * (1 - u) on [0, 1], at u = 0.354.
+    private const double ImpulseEnvelopePeak = 0.5792303274;
+
+    /// <summary>
+    /// A bump that rises from 0 to 1 in the first third of <paramref name="length"/> seconds and smoothly falls back to 0.
+    /// Returns 0 outside of [0, length].
+    /// </summary>
+    public static double ImpulseEnvelope(double time, double length)
+    {
+        if (!(length > 0.0) || !(time > 0.0) || time >= length)
+        {
+            return 0.0;
+        }
+
+        double u = time / length;
+        return Math.Sin(Math.PI * u) * (1.0 - u) / ImpulseEnvelopePeak;
+    }
+
     public static float Sanitize(float value, float fallback)
     {
         return float.IsFinite(value) ? value : fallback;
